@@ -52,7 +52,8 @@ def get_device_flops(unit="T", device_name=None):
 
     Returns:
         float: The theoretical FLOPS capacity of the current device in the specified unit.
-        Returns float('inf') for unknown GPU types.
+        Returns NaN for unknown FlagOS capacity (MFU is unavailable), and the
+        legacy float('inf') sentinel for other unknown GPU types.
     """
 
     def unit_convert(number, level):
@@ -65,15 +66,41 @@ def get_device_flops(unit="T", device_name=None):
             ptr += 1
         return number
 
-    # pass device_name is for testing purpose only
+    # Preserve the historical capacity lookup for existing backends. FlagOS
+    # may have no device-name API or no published capacity in our table.
+    is_flagos = False
     if device_name is None:
         device = get_torch_device()
+        is_flagos = device is getattr(torch, "flagos", None)
         if device == torch.cpu:
             device_name = "CPU"
+        elif is_flagos:
+            device_name = ""
+            get_name = getattr(device, "get_device_name", None)
+            if callable(get_name):
+                try:
+                    device_name = get_name()
+                except (AttributeError, NotImplementedError, RuntimeError, OSError):
+                    pass
+            # A present name API may still be unsupported or return no name.
+            # Do not discard a usable properties API in those cases.
+            if not isinstance(device_name, str) or not device_name.strip():
+                device_name = ""
+                get_properties = getattr(device, "get_device_properties", None)
+                if callable(get_properties):
+                    try:
+                        properties = get_properties(device.current_device())
+                        device_name = getattr(properties, "name", "")
+                    except (AttributeError, NotImplementedError, RuntimeError, OSError):
+                        pass
+            if not isinstance(device_name, str):
+                device_name = ""
         else:
-            device_name = get_torch_device().get_device_name()
+            device_name = device.get_device_name()
 
-    flops = float("inf")  # INF flops for unkown gpu type
+    # NaN propagates through MFU arithmetic as unknown instead of fabricated 0.
+    # Retain the legacy infinity sentinel for non-FlagOS callers.
+    flops = float("nan") if is_flagos else float("inf")
 
     for key, value in sorted(_DEVICE_FLOPS.items(), reverse=True):
         if key in device_name:

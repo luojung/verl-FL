@@ -11,24 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Rollout with huggingface models.
-TODO: refactor this class. Currently, it will hang when using FSDP HybridShard. We should actually create a single
-GPU model. Then, get full state_dict and bind the state_dict to the single GPU model. Then, use the single GPU model
-to perform generation.
+"""Synchronous text-only HF generation using the actor's live parameters.
+
+FSDP generation is restricted to a single-rank, root-only NO_SHARD wrapper.
+Calling a delegated HF generate bypasses the root FSDP forward; nested/sharded
+wrappers require a different, separately validated generation implementation.
 """
 
 import contextlib
 
 import torch
-import torch.distributed
 from tensordict import TensorDict
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
 from transformers import GenerationConfig
 
 from verl import DataProto
-from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.torch_functional import get_response_mask
 
 from .base import BaseRollout
@@ -37,141 +37,262 @@ __all__ = ["HFRollout"]
 
 
 class HFRollout(BaseRollout):
-    def __init__(self, module: nn.Module, config):
-        super().__init__()
+    def __init__(self, module: nn.Module, config, tokenizer=None, *, data_config=None, device=None):
+        # Do not construct an async inference engine or copy actor parameters.
         self.config = config
         self.module = module
+        self.tokenizer = tokenizer
+        self.data_config = data_config if data_config is not None else {}
+        self.device = torch.device(device) if device is not None else None
+        generation_module = self._generation_module()
+        if getattr(getattr(generation_module, "config", None), "is_encoder_decoder", False):
+            raise NotImplementedError("Shared HF rollout requires a decoder-only causal language model")
+
+    def _generation_module(self):
+        if not isinstance(self.module, FSDP):
+            return self.module
+        nested = any(isinstance(child, FSDP) for child in self.module.modules() if child is not self.module)
+        if (
+            self.module.process_group.size() != 1
+            or self.module.sharding_strategy != ShardingStrategy.NO_SHARD
+            or nested
+        ):
+            raise NotImplementedError(
+                "Shared HF rollout requires single-rank, root-only FSDP NO_SHARD. "
+                "Disable nested auto-wrapping for this HF single-card path; "
+                "sharded/multi-card HF generation is not supported or validated."
+            )
+        if not getattr(self.module, "_use_orig_params", False):
+            raise NotImplementedError(
+                "Shared HF rollout requires FSDP use_orig_params=True. "
+                "Direct wrapped-module generation with use_orig_params=False is unsupported: "
+                "parameter views may become stale after mixed-precision actor execution or offload/reload."
+            )
+        # With NO_SHARD and no nested wrappers, these are the live actor tensors.
+        # Neither summon_full_params nor private lazy-state resets are needed.
+        return self.module.module
+
+    async def resume(self, tags: list[str]):
+        # Residency/offload is owned by the synchronous actor worker.
+        return None
+
+    async def update_weights(self, weights, **kwargs):
+        raise NotImplementedError("HF rollout shares live actor weights; external weight synchronization is invalid")
+
+    async def release(self):
+        return None
+
+    def _input_device(self):
+        if self.device is not None:
+            return self.device
+        if isinstance(self.module, FSDP):
+            return self.module.compute_device
+        try:
+            return next(self.module.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def _token_ids(self, prompts):
+        eos = prompts.meta_info.get("eos_token_id")
+        pad = prompts.meta_info.get("pad_token_id")
+        if eos is None and self.tokenizer is not None:
+            eos = self.tokenizer.eos_token_id
+        if pad is None and self.tokenizer is not None:
+            pad = self.tokenizer.pad_token_id
+        if isinstance(eos, (list, tuple)) and not eos:
+            eos = None
+        if pad is None and eos is not None:
+            pad = eos[0] if isinstance(eos, (list, tuple)) else eos
+        if pad is None:
+            raise ValueError("HF rollout needs a pad_token_id (or an eos_token_id for padding)")
+        return eos, pad
+
+    def _materialize_raw_prompts(self, prompts: DataProto) -> DataProto:
+        """Build left-padded tokens without mutating tokenizer settings or the input batch."""
+        if any(key in prompts.non_tensor_batch for key in ("multi_modal_data", "multi_modal_inputs")):
+            raise NotImplementedError("Shared HF rollout is text-only; multimodal processor inputs are unsupported")
+        device = self._input_device()
+        tensors = dict(prompts.batch.items()) if prompts.batch is not None else {}
+        if "input_ids" not in tensors:
+            if self.tokenizer is None or "raw_prompt" not in prompts.non_tensor_batch:
+                raise ValueError("HFRollout requires input_ids, or raw_prompt and a tokenizer")
+            limit = self.config.prompt_length
+            if limit <= 0:
+                raise ValueError("prompt_length must be positive")
+            truncation = prompts.meta_info.get("hf_prompt_truncation", self.data_config.get("truncation", "error"))
+            if truncation not in {"error", "left", "right", "middle"}:
+                raise ValueError(f"Unsupported prompt truncation policy: {truncation}")
+            template_kwargs = dict(
+                prompts.meta_info.get("hf_chat_template_kwargs", self.data_config.get("apply_chat_template_kwargs", {}))
+            )
+            if template_kwargs.get("return_tensors") is not None or template_kwargs.get("return_dict", False):
+                raise ValueError("HF chat-template kwargs must return a flat token list, not tensors or a dictionary")
+            template_kwargs.update(tokenize=True, add_generation_prompt=True, padding=False, truncation=False)
+            rows = []
+            for chat in prompts.non_tensor_batch["raw_prompt"]:
+                if isinstance(chat, (str, bytes, dict)):
+                    raise ValueError("raw_prompt must contain sequences of chat-message dictionaries")
+                messages = list(chat)
+                for message in messages:
+                    if not isinstance(message, dict):
+                        raise ValueError("raw_prompt messages must be dictionaries")
+                    content = message.get("content")
+                    if isinstance(content, (list, tuple)) and any(
+                        not isinstance(part, dict) or part.get("type") != "text" for part in content
+                    ):
+                        raise NotImplementedError("Shared HF rollout cannot tokenize image/video/audio prompts")
+                tokens = list(self.tokenizer.apply_chat_template(messages, **template_kwargs))
+                if len(tokens) > limit:
+                    if truncation == "error":
+                        raise ValueError(f"Prompt has {len(tokens)} tokens, exceeding prompt_length={limit}")
+                    if truncation == "left":
+                        tokens = tokens[-limit:]
+                    elif truncation == "right":
+                        tokens = tokens[:limit]
+                    else:
+                        left = limit // 2
+                        tokens = tokens[:left] + tokens[-(limit - left) :]
+                if not tokens:
+                    raise ValueError("HF rollout does not support empty tokenized prompts")
+                rows.append(tokens)
+            if not rows:
+                raise ValueError("HF rollout requires a non-empty batch")
+            _, pad = self._token_ids(prompts)
+            width = max(map(len, rows))
+            input_ids = torch.full((len(rows), width), pad, dtype=torch.long, device=device)
+            attention_mask = torch.zeros_like(input_ids)
+            for row, tokens in enumerate(rows):
+                input_ids[row, -len(tokens) :] = torch.tensor(tokens, dtype=torch.long, device=device)
+                attention_mask[row, -len(tokens) :] = 1
+            tensors.update(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=compute_position_id_with_mask(attention_mask),
+            )
+        else:
+            if "attention_mask" not in tensors:
+                raise ValueError("Pretokenized HF prompts require an explicit attention_mask (pad may equal eos)")
+            tensors["input_ids"] = tensors["input_ids"].to(device)
+            tensors["attention_mask"] = tensors["attention_mask"].to(device)
+
+        idx, mask = tensors["input_ids"], tensors["attention_mask"]
+        if idx.ndim != 2 or mask.shape != idx.shape or idx.size(0) == 0 or idx.size(1) == 0:
+            raise ValueError("HF input_ids/attention_mask must have matching non-empty [batch, sequence] shapes")
+        if idx.size(1) > self.config.prompt_length:
+            raise ValueError("Pretokenized prompts exceed rollout.prompt_length")
+        if not torch.all((mask == 0) | (mask == 1)) or not torch.all(mask[:, -1] == 1):
+            raise ValueError("HF generation requires binary, non-empty left-padded attention masks")
+        if torch.any(mask[:, 1:] < mask[:, :-1]):
+            raise ValueError("HF generation requires left padding, not right padding or holes")
+        positions = tensors.get("position_ids")
+        if positions is None:
+            positions = compute_position_id_with_mask(mask)
+        if positions.shape != idx.shape:
+            raise ValueError("Shared HF text rollout requires 2-D position_ids matching input_ids")
+        tensors["position_ids"] = positions.to(device)
+        return DataProto(
+            batch=TensorDict(tensors, batch_size=idx.size(0)),
+            non_tensor_batch=prompts.non_tensor_batch.copy(),
+            meta_info=prompts.meta_info.copy(),
+        )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
+        prompts = self._materialize_raw_prompts(prompts)
         batch_size = prompts.batch.batch_size[0]
-        num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
-        batch_prompts = prompts.chunk(chunks=num_chunks)
-        output = [self._generate_minibatch(p) for p in batch_prompts]
-        output = DataProto.concat(output)
-        return output
+        micro_batch_size = self.config.get("micro_batch_size", batch_size)
+        if micro_batch_size is None:
+            micro_batch_size = batch_size
+        if micro_batch_size <= 0:
+            raise ValueError("HF micro_batch_size must be positive")
+        # split(), unlike chunk(floor(batch_size / micro_batch_size)), enforces
+        # the memory bound and supports a final, smaller microbatch.
+        return DataProto.concat([self._generate_minibatch(p) for p in prompts.split(micro_batch_size)])
 
     @torch.no_grad()
     def _generate_minibatch(self, prompts: DataProto) -> DataProto:
-        # make sampling args can be overridden by inputs
-        do_sample = prompts.meta_info.get("do_sample", self.config.do_sample)
         is_validate = prompts.meta_info.get("validate", False)
-
-        temperature = prompts.meta_info.get("temperature", self.config.temperature)
+        sampling = self.config.val_kwargs if is_validate else self.config
+        do_sample = prompts.meta_info.get("do_sample", sampling.do_sample)
         response_length = prompts.meta_info.get("response_length", self.config.response_length)
-        top_p = prompts.meta_info.get("top_p", self.config.get("top_p", 1.0))
-        top_k = max(0, prompts.meta_info.get("top_k", self.config.get("top_k", 0)))  # to be compatible with vllm
-
-        if not do_sample:
-            # do_sample==False -> greedy decoding
-            kwargs = {
-                "do_sample": False,
-                "num_beams": 1,
-            }
-        elif is_validate:
-            # do validate and do sample -> use val_kwargs
-            kwargs = {
-                "do_sample": True,
-                "num_beams": 1,
-                "top_k": max(0, self.config.val_kwargs.top_k),  # to be compatible with vllm
-                "top_p": self.config.val_kwargs.top_p,
-                "temperature": self.config.val_kwargs.temperature,
-                "num_return_sequences": 1,  # if validate, already repeat in ray_trainer
-            }
-        else:
-            # do_sample -> use rollout config
-            kwargs = {
-                "do_sample": True,
-                "num_beams": 1,
-                "top_p": top_p,
-                "top_k": top_k,
-                "temperature": temperature,
-                # already repeat in ray_trainer
-                # https://github.com/volcengine/verl/blob/2fdfbdcba6f2e076f64bc47922d8fe6cf7dc7da5/verl/trainer/ppo/ray_trainer.py#L1117
-                "num_return_sequences": 1,
-            }
-
-        # make config according to generate mode
-        generation_config = GenerationConfig(**kwargs)
-
-        idx = prompts.batch["input_ids"]  # (bs, prompt_length)
-        prompt_length = idx.size(1)
-        attention_mask = prompts.batch["attention_mask"]  # left-padded attention_mask
-        position_ids = prompts.batch["position_ids"]
-
-        # used to construct attention_mask
-        eos_token_id = prompts.meta_info["eos_token_id"]
-        pad_token_id = prompts.meta_info["pad_token_id"]
-
-        self.module.eval()
-        param_ctx = contextlib.nullcontext()
-
-        if isinstance(self.module, FSDP):
-            # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-        with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-            output = self.module.generate(
-                input_ids=idx,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                do_sample=do_sample,
-                max_new_tokens=response_length,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                generation_config=generation_config,
-                output_scores=False,  # this is potentially very large
-                return_dict_in_generate=True,
-                use_cache=True,
+        if response_length <= 0:
+            raise ValueError("HF response_length must be positive")
+        kwargs = {"do_sample": do_sample, "num_beams": 1, "num_return_sequences": 1}
+        if do_sample:
+            kwargs.update(
+                temperature=prompts.meta_info.get("temperature", sampling.temperature),
+                top_p=prompts.meta_info.get("top_p", sampling.top_p),
+                top_k=max(0, prompts.meta_info.get("top_k", sampling.top_k)),
             )
-
-        # TODO: filter out the seq with no answers like ds-chat
-        seq = output.sequences
-        generated_batch_size = seq.size(0)  # bs * num_return_sequences
-
-        # huggingface generate will stop generating when all the batch reaches [EOS].
-        # We have to pad to response_length
-        sequence_length = prompt_length + self.config.response_length
-        delta_length = sequence_length - seq.shape[1]
-
-        if delta_length > 0:
-            delta_tokens = torch.ones(size=(generated_batch_size, delta_length), device=seq.device, dtype=seq.dtype)
-            delta_tokens = pad_token_id * delta_tokens
-            seq = torch.cat((seq, delta_tokens), dim=1)
-        assert seq.shape[1] == sequence_length
-
-        # make necessary reputations if num_return_sequences > 1
-        num_return_sequences = kwargs.get("num_return_sequences", 1)
-        if num_return_sequences > 1:
-            position_ids = position_ids.repeat_interleave(num_return_sequences, dim=0)
-            attention_mask = attention_mask.repeat_interleave(num_return_sequences, dim=0)
-
-        prompt = seq[:, :prompt_length]  # (generated_batch_size, prompt_length)
-        response = seq[:, prompt_length:]  # (generated_batch_size, response_length)
-
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).repeat(generated_batch_size, 1)
-
-        response_position_ids = position_ids[:, -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-
-        response_attention_mask = get_response_mask(
-            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+        kwargs["repetition_penalty"] = self.config.get("repetition_penalty", 1.0)
+        eos_token_id, pad_token_id = self._token_ids(prompts)
+        if self.config.get("ignore_eos", False):
+            eos_token_id = None
+        generation_config = GenerationConfig(
+            **kwargs,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            max_new_tokens=response_length,
+            use_cache=True,
+            output_scores=False,
+            return_dict_in_generate=True,
         )
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+        idx = prompts.batch["input_ids"]
+        prompt_length = idx.size(1)
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
+        generator = self._generation_module()
+        modes = [(child, child.training) for child in self.module.modules()]
+        dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(self.config.get("dtype", "bfloat16"))
+        amp = (
+            torch.autocast(device_type=idx.device.type, dtype=dtype)
+            if idx.device.type != "cpu" and dtype is not None
+            else contextlib.nullcontext()
+        )
+        try:
+            self.module.eval()
+            with amp:
+                output = generator.generate(
+                    input_ids=idx,
+                    attention_mask=attention_mask,
+                    # HF derives and extends position_ids from the evolving
+                    # attention_mask. Passing a fixed prompt-only position_ids
+                    # can reuse its final position on every cached decode step.
+                    generation_config=generation_config,
+                )
+        finally:
+            # Restore the previous mode, including mixed-mode submodules and
+            # exception paths. Never force an eval-only actor into train mode.
+            for child, training in modes:
+                child.train(training)
 
+        seq = output.sequences
+        sequence_length = prompt_length + response_length
+        if seq.size(0) != idx.size(0) or not prompt_length <= seq.size(1) <= sequence_length:
+            raise ValueError("HF generate returned an unexpected batch or sequence length")
+        generated_length = seq.size(1) - prompt_length
+        if seq.size(1) < sequence_length:
+            padding = torch.full(
+                (seq.size(0), sequence_length - seq.size(1)), pad_token_id, device=seq.device, dtype=seq.dtype
+            )
+            seq = torch.cat((seq, padding), dim=1)
+        response = seq[:, prompt_length:]
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device).unsqueeze(0)
+        response_position_ids = position_ids[:, -1:] + delta_position_id
+        response_mask = (
+            get_response_mask(response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+            if eos_token_id is not None
+            else torch.ones_like(response, dtype=attention_mask.dtype)
+        )
+        response_mask[:, generated_length:] = 0
         batch = TensorDict(
             {
-                "prompts": prompt,
+                "prompts": seq[:, :prompt_length],
                 "responses": response,
                 "input_ids": seq,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
+                "attention_mask": torch.cat((attention_mask, response_mask), dim=-1),
+                "response_mask": response_mask,
+                "position_ids": torch.cat((position_ids, response_position_ids), dim=-1),
             },
-            batch_size=generated_batch_size,
+            batch_size=seq.size(0),
         )
-
-        # empty cache before compute old_log_prob
-        get_torch_device().empty_cache()
-
-        self.module.train()
-        return DataProto(batch=batch)
+        return DataProto(batch=batch, meta_info=prompts.meta_info.copy())

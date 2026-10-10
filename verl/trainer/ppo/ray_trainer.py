@@ -592,6 +592,8 @@ class RayPPOTrainer:
 
         # pop those keys for generation
         batch_keys_to_pop = []
+        if not self.async_rollout_mode and batch.batch is not None:
+            batch_keys_to_pop = [key for key in ("input_ids", "attention_mask", "position_ids") if key in batch.batch]
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
@@ -601,6 +603,14 @@ class RayPPOTrainer:
         # For agent loop, we need reward model keys to compute score.
         if self.async_rollout_mode:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+        else:
+            # Workers receive actor_rollout_ref, not the trainer's data config.
+            # Carry text tokenization policy alongside raw prompts instead of
+            # silently applying tokenizer defaults (usually right truncation).
+            gen_batch.meta_info["hf_prompt_truncation"] = self.config.data.get("truncation", "error")
+            gen_batch.meta_info["hf_chat_template_kwargs"] = dict(
+                self.config.data.get("apply_chat_template_kwargs", {})
+            )
 
         return gen_batch
 
@@ -639,14 +649,16 @@ class RayPPOTrainer:
             sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
-            }
+            test_gen_batch.meta_info.update(
+                {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "recompute_log_prob": False,
+                    "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                    "validate": True,
+                    "global_steps": self.global_steps,
+                }
+            )
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
@@ -913,27 +925,31 @@ class RayPPOTrainer:
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
 
-        # create async rollout manager and request scheduler
-        # Note: mode is always "async" since sync mode is deprecated
-        self.async_rollout_mode = True
+        self._init_rollout_manager()
 
-        # Support custom AgentLoopManager via config
-        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
-        if manager_class_fqn:
-            AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
-        else:
-            from verl.experimental.agent_loop import AgentLoopManager
+    def _init_rollout_manager(self):
+        # vLLM/SGLang use the async agent loop. The legacy Hugging Face rollout
+        # is synchronous and executes on the actor worker itself.
+        self.async_rollout_mode = self.config.actor_rollout_ref.rollout.name != "hf"
+        self.async_rollout_manager = None
+        if self.async_rollout_mode:
+            # Support custom AgentLoopManager via config
+            manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+            if manager_class_fqn:
+                AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+            else:
+                from verl.experimental.agent_loop import AgentLoopManager
 
-        if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
-            rm_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-        else:
-            rm_resource_pool = None
+            if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
+                rm_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            else:
+                rm_resource_pool = None
 
-        self.async_rollout_manager = AgentLoopManager(
-            config=self.config,
-            worker_group=self.actor_rollout_wg,
-            rm_resource_pool=rm_resource_pool,
-        )
+            self.async_rollout_manager = AgentLoopManager(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rm_resource_pool=rm_resource_pool,
+            )
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe

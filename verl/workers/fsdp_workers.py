@@ -19,8 +19,9 @@ import datetime
 import json
 import logging
 import os
+import tempfile
 import warnings
-from dataclasses import asdict
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import numpy as np
@@ -34,7 +35,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, ShardingStrategy, StateDictType
 
 try:
     # for torch 2.5+
@@ -50,6 +51,11 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
+from verl.utils.checkpoint.lora_adapter import (
+    collect_lora_adapter_state_dict,
+    run_lora_export_stage,
+    serialize_lora_adapter_config,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import (
     get_device_id,
@@ -71,7 +77,6 @@ from verl.utils.fsdp_utils import (
     get_init_weight_context_manager,
     get_shard_placement_fn,
     init_fn,
-    layered_summon_lora_params,
     load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
     offload_fsdp_model_to_cpu,
@@ -81,6 +86,7 @@ from verl.utils.fsdp_utils import (
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
+from verl.utils.model_compat import get_auto_model_class, resolve_lora_target_modules
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
@@ -161,8 +167,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
 
-        # build device mesh for FSDP
+        # This reviewed FlagOS HF path is deliberately single-card FSDP1.
+        # Do not extrapolate the previous NO_SHARD workaround to sharded runs.
         world_size = torch.distributed.get_world_size()
+        if device_name == "flagos" and "rollout" in role and self.config.rollout.name == "hf":
+            if world_size != 1 or self.config.actor.strategy != "fsdp":
+                raise NotImplementedError(
+                    "Shared HF rollout on flagos is supported only for single-card FSDP1. "
+                    "Multi-card/FSDP2 generation requires separate validation."
+                )
+
+        # build device mesh for FSDP
         # TODO(sgm): support FSDP hybrid shard for larger model
         self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
 
@@ -290,13 +305,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         tiled_mlp_shards=4,
     ):
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import (
-            AutoConfig,
-            AutoModel,
-            AutoModelForCausalLM,
-            AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
-        )
+        from transformers import AutoConfig
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -370,31 +379,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            has_remote_code = hasattr(actor_model_config, "auto_map") and any(
-                actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
-            )
-            if has_remote_code:
-                auto_class = next(
-                    k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
-                )
-                match auto_class:
-                    case "AutoModelForVision2Seq":
-                        actor_module_class = AutoModelForVision2Seq
-                    case "AutoModelForCausalLM":
-                        actor_module_class = AutoModelForCausalLM
-                    case "AutoModelForImageTextToText":
-                        actor_module_class = AutoModelForImageTextToText
-                    case _:
-                        actor_module_class = AutoModel
-            else:
-                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
-                    actor_module_class = AutoModelForVision2Seq
-                elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
-                    actor_module_class = AutoModelForCausalLM
-                elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
-                    actor_module_class = AutoModelForImageTextToText
-                else:
-                    actor_module_class = AutoModel
+            actor_module_class = get_auto_model_class(actor_model_config)
 
             actor_module = actor_module_class.from_pretrained(
                 pretrained_model_name_or_path=local_path,
@@ -452,17 +437,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             else:
                 # Convert config to regular Python types before creating PEFT model
+                target_modules = resolve_lora_target_modules(convert_to_regular_types(self.config.model.target_modules))
+                if self.rank == 0:
+                    logger.info("Actor LoRA target modules: %s", target_modules)
                 lora_config = {
                     "task_type": TaskType.CAUSAL_LM,
                     "r": self.config.model.lora_rank,
                     "lora_alpha": self.config.model.lora_alpha,
-                    "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                    "target_modules": target_modules,
                     "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
                     "bias": "none",
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
 
+        shared_hf_single_card = (
+            role == "actor" and self._is_rollout and self.config.rollout.name == "hf" and self.world_size == 1
+        )
+        if shared_hf_single_card and self._is_lora:
+            # Root-only FSDP needs uniform parameter dtypes. PEFT creates LoRA
+            # parameters in FP32 even when base weights were loaded in BF16.
+            actor_module.to(torch_dtype)
+            if self.rank == 0:
+                logger.info("Shared HF actor parameter dtype: %s", torch_dtype)
+
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
+        if shared_hf_single_card:
+            # HF bypasses the FSDP forward during generation. Keep original
+            # parameter objects for every shared-HF actor, not just LoRA.
+            self.use_orig_params = True
         if self.config.actor.get("freeze_vision_tower", False):
             vision_tower = get_vl_model_vision_tower(actor_module)
             if vision_tower is not None:
@@ -500,10 +502,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             is_lora=self._is_lora,
         )
 
-        # if self._is_rollout and self.config.rollout.name == "hf":
-        #     # TODO(zhangchi.usc1992, shengguangming) fix me.
-        #     Current, auto_wrap_policy causes HFRollout to hang in Gemma
-        #     auto_wrap_policy = None
+        if shared_hf_single_card:
+            # generate() is delegated to HF/PEFT and must not initialize nested
+            # FSDP roots. Construction, not private lazy-state resets, enforces
+            # the supported NO_SHARD shared-actor invariant.
+            auto_wrap_policy = None
 
         if self.rank == 0:
             print(f"wrap_policy: {auto_wrap_policy}")
@@ -511,6 +514,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         fsdp_mesh = self.device_mesh
         fsdp_enable_zero3 = fsdp_config.reshard_after_forward
         sharding_strategy = get_sharding_strategy(fsdp_mesh, fsdp_enable_zero3)
+        if shared_hf_single_card:
+            sharding_strategy = ShardingStrategy.NO_SHARD
 
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
@@ -645,9 +650,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-        )
+        if rollout_name == "hf":
+            from verl.workers.rollout.hf_rollout import HFRollout
+
+            self.rollout = HFRollout(
+                module=self.actor_module_fsdp, config=self.config.rollout, tokenizer=self.tokenizer
+            )
+            if self.rank == 0:
+                logger.info("HF rollout shares the actor module")
+        else:
+            self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+            )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params
@@ -923,8 +937,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["perf/mfu/actor"] = (
                 estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
             )
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            device_module = get_torch_device()
+            # Preserve real zero measurements, but never fabricate zero for an
+            # unsupported accelerator counter. NaN explicitly denotes unknown.
+            for metric, attribute in (
+                ("perf/max_memory_allocated_gb", "max_memory_allocated"),
+                ("perf/max_memory_reserved_gb", "max_memory_reserved"),
+            ):
+                counter = getattr(device_module, attribute, None)
+                metrics[metric] = counter() / (1024**3) if callable(counter) else float("nan")
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
@@ -945,6 +966,37 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    @contextmanager
+    def _shared_hf_generation(self):
+        """Restore actor offload, RNG and mixed module modes even on failure."""
+        device = get_torch_device()
+        training_rng = device.get_rng_state()
+        modes = [(module, module.training) for module in self.actor_module_fsdp.modules()]
+        loaded = False
+        rng_switched = False
+        try:
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+                loaded = True
+            device.set_rng_state(self.gen_random_states)
+            rng_switched = True
+            yield
+        finally:
+            try:
+                if rng_switched:
+                    self.gen_random_states = device.get_rng_state()
+            finally:
+                try:
+                    device.set_rng_state(training_rng)
+                    for module, training in modes:
+                        module.training = training
+                finally:
+                    try:
+                        if loaded:
+                            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                    finally:
+                        device.empty_cache()
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
@@ -963,17 +1015,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         prompts.meta_info.update(meta_info)
 
         timing_generate = {}
-        if self._is_actor:  # For rollout only, we do not switch context.
-            loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
-            log_gpu_memory_usage("After switch to rollout mode", logger=logger)
-
-        with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
-
-        if self._is_actor:
-            loop.run_until_complete(self.trainer_mode())
-            log_gpu_memory_usage("After switch to trainer mode", logger=logger)
+        if self.config.rollout.name == "hf":
+            # Shared HF uses actor parameters directly: no state-dict transfer,
+            # no async engine mode switch and no unnecessary offload mid-run.
+            with self._shared_hf_generation(), simple_timer("generate_sequences", timing_generate):
+                output = self.rollout.generate_sequences(prompts=prompts)
+        else:
+            if self._is_actor:
+                loop = get_event_loop()
+                loop.run_until_complete(self.rollout_mode())
+                log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+            try:
+                with simple_timer("generate_sequences", timing_generate):
+                    output = self.rollout.generate_sequences(prompts=prompts)
+            finally:
+                if self._is_actor:
+                    loop.run_until_complete(self.trainer_mode())
+                    log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         # We calculate the average timing across all ranks
         # to make sure meta_info["timing"] is the same
@@ -1088,33 +1146,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         dist.barrier()
 
-        if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
+        if self._is_lora:
+            # Collection and status agreement are SPMD. Rank-zero guards apply
+            # only to filesystem writes, never to FSDP collectives.
+            peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            adapter_state = collect_lora_adapter_state_dict(self.actor_module_fsdp)
+            adapter_config = run_lora_export_stage(
+                "adapter configuration", lambda: serialize_lora_adapter_config(peft_model.peft_config["default"])
+            )
             lora_save_path = os.path.join(local_path, "lora_adapter")
-            peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
-            peft_config = {}
-            if dist.get_rank() == 0:
-                os.makedirs(lora_save_path, exist_ok=True)
-                peft_config = asdict(peft_model.peft_config.get("default", {}))
-                peft_config["task_type"] = peft_config["task_type"].value
-                peft_config["peft_type"] = peft_config["peft_type"].value
-                peft_config["target_modules"] = list(peft_config["target_modules"])
-            try:
-                if fsdp_version(self.actor_module_fsdp) > 0:
-                    self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
-                    lora_params = layered_summon_lora_params(self.actor_module_fsdp)
-                    if dist.get_rank() == 0:
-                        save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
-                        with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
-                            json.dump(peft_config, f, ensure_ascii=False, indent=4)
-            except Exception as e:
-                log_with_rank(
-                    f"Save LoRA Adapter Error ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
-                )
 
-            dist.barrier()
+            def write_adapter():
+                if dist.get_rank() != 0:
+                    return
+                os.makedirs(lora_save_path, exist_ok=True)
+                # Fully validate both candidates before replacing either final
+                # file. A publish error still fails export; it never logs success.
+                with tempfile.TemporaryDirectory(prefix=".adapter-", dir=lora_save_path) as staging:
+                    weights_path = os.path.join(staging, "adapter_model.safetensors")
+                    config_path = os.path.join(staging, "adapter_config.json")
+                    save_file(adapter_state, weights_path)
+                    content = json.dumps(adapter_config, ensure_ascii=False, indent=4, allow_nan=False)
+                    with open(config_path, "w", encoding="utf-8") as config_file:
+                        config_file.write(content)
+                    with open(config_path, encoding="utf-8") as config_file:
+                        json.load(config_file)
+                    os.replace(weights_path, os.path.join(lora_save_path, "adapter_model.safetensors"))
+                    os.replace(config_path, os.path.join(lora_save_path, "adapter_config.json"))
+
+            run_lora_export_stage("adapter filesystem write", write_adapter)
             log_with_rank(
-                f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}",
-                rank=dist.get_rank(),
+                f"Saved non-empty LoRA adapter to: {lora_save_path}",
+                rank=self.rank,
                 logger=logger,
                 log_only_rank_0=True,
             )

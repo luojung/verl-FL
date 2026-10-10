@@ -127,6 +127,14 @@ class TaskRunner:
 
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
+        use_sync_hf_rollout = config.actor_rollout_ref.rollout.name == "hf"
+        if use_sync_hf_rollout and use_legacy_worker_impl == "disable":
+            raise ValueError("Shared HF rollout requires trainer.use_legacy_worker_impl=auto or enable")
+        if use_sync_hf_rollout and config.actor_rollout_ref.actor.strategy != "fsdp":
+            raise NotImplementedError("Shared HF rollout currently supports only the legacy FSDP1 actor")
+        if use_sync_hf_rollout and config.reward_model.get("use_reward_loop", False):
+            raise ValueError("Shared HF rollout requires reward_model.use_reward_loop=false (no async agent loop)")
+
         # use new model engine implementation
         if use_legacy_worker_impl == "disable":
             from verl.workers.engine_workers import ActorRolloutRefWorker
@@ -143,12 +151,20 @@ class TaskRunner:
             self.mapping[role] = "global_pool"
             return actor_rollout_cls, ray_worker_group_cls
 
-        # Note: sync mode validation is now handled in RolloutConfig.__post_init__
-        # Always use async worker since sync mode is deprecated and rejected
+        # The legacy HF rollout is synchronous and shares the actor module.  It
+        # must expose the parent's registered init/generate/log-prob/update
+        # methods to the colocated Ray worker.  The async subclass only declares
+        # direct vLLM/SGLang RPC methods, so selecting it for HF leaves the
+        # worker group without the synchronous training interface.
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
-            from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
+            if use_sync_hf_rollout:
+                from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
-            actor_rollout_cls = AsyncActorRolloutRefWorker
+                actor_rollout_cls = ActorRolloutRefWorker
+            else:
+                from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
+
+                actor_rollout_cls = AsyncActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":

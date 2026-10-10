@@ -23,6 +23,7 @@ import os
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
+import gc
 import logging
 import re
 import time
@@ -41,18 +42,18 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import Dataset, DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
+from transformers import AutoConfig, PreTrainedModel
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_checkpoint_tracker_filename
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset import SFTDataset
-from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.device import (
     auto_set_device,
     get_device_id,
     get_device_name,
+    get_torch_device,
     is_cuda_available,
     is_npu_available,
 )
@@ -69,6 +70,7 @@ from verl.utils.fsdp_utils import (
     init_fn,
 )
 from verl.utils.logger import log_with_rank
+from verl.utils.model_compat import get_auto_model_class, get_text_forward_kwargs, resolve_lora_target_modules
 from verl.utils.profiler import log_gpu_memory_usage
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_dtypes import PrecisionType
@@ -175,8 +177,7 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(f"Using FSDP rank {rank} and size {world_size} for data distribution")
 
-        # Set pin_memory_device when pin_memory is enabled.
-        device_name = get_device_name()
+        loader_kwargs = _get_sft_dataloader_kwargs(config.data, get_device_name())
 
         self.train_sampler = DistributedSampler(
             self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True
@@ -185,10 +186,8 @@ class FSDPSFTTrainer:
             dataset=self.train_dataset,
             batch_size=config.data.train_batch_size,
             sampler=self.train_sampler,
-            num_workers=8,
-            pin_memory=True,
             drop_last=True,
-            pin_memory_device=device_name,
+            **loader_kwargs,
         )
 
         self.val_sampler = DistributedSampler(
@@ -198,10 +197,8 @@ class FSDPSFTTrainer:
             dataset=self.val_dataset,
             batch_size=config.data.micro_batch_size_per_gpu,
             sampler=self.val_sampler,
-            num_workers=8,
-            pin_memory=True,
             drop_last=True,
-            pin_memory_device=device_name,
+            **loader_kwargs,
         )
 
     def _build_model_optimizer(self):
@@ -237,12 +234,16 @@ class FSDPSFTTrainer:
         )
 
         with init_context():
-            self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+            model_cls = get_auto_model_class(config)
+            default_attn = "eager" if get_device_name() in ("flagos", "privateuseone", "cpu") else "flash_attention_2"
+            attn_implementation = self.config.model.get("attn_implementation", default_attn)
+            self.model: PreTrainedModel = model_cls.from_pretrained(
                 local_model_path,
                 config=config,
                 torch_dtype=torch_dtype,
-                attn_implementation="flash_attention_2",
+                attn_implementation=attn_implementation,
                 trust_remote_code=trust_remote_code,
+                local_files_only=self.config.model.get("local_files_only", False),
             )
 
             if self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1:
@@ -274,13 +275,18 @@ class FSDPSFTTrainer:
                         peft_config.task_type = TaskType.CAUSAL_LM
                 else:
                     # Convert config to regular Python types before creating PEFT model
+                    target_modules = resolve_lora_target_modules(
+                        convert_to_regular_types(self.config.model.target_modules)
+                    )
                     lora_config = {
                         "task_type": TaskType.CAUSAL_LM,
                         "r": self.config.model.lora_rank,
                         "lora_alpha": self.config.model.lora_alpha,
-                        "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                        "target_modules": target_modules,
                         "bias": "none",
                     }
+                    if self.device_mesh.get_rank() == 0:
+                        print(f"LoRA target_modules={target_modules}")
                     self.model = get_peft_model(self.model, LoraConfig(**lora_config))
                 self.model = self.model.to(torch_dtype)
 
@@ -386,15 +392,20 @@ class FSDPSFTTrainer:
             if not use_sp:
                 # Standard forward pass without sequence parallel
                 labels = input_ids[:, 1:].contiguous()
-                output = self.fsdp_model(
-                    input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
-                )
+                model_kwargs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "use_cache": False,
+                }
+                model_kwargs.update(get_text_forward_kwargs(self.model_config, input_ids))
+                output = self.fsdp_model(**model_kwargs)
                 logits = output.logits
 
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels.contiguous()
                 # Flatten the tokens
-                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+                shift_logits = shift_logits.view(-1, shift_logits.size(-1))
                 shift_labels = shift_labels.view(-1)
                 # Enable model parallelism
                 shift_labels = shift_labels.to(shift_logits.device)
@@ -436,6 +447,7 @@ class FSDPSFTTrainer:
                     attention_mask=None,  # Not needed with flash attention varlen
                     position_ids=position_ids_rmpad_padded,
                     use_cache=False,
+                    **get_text_forward_kwargs(self.model_config, input_ids_rmpad_sliced),
                 )
 
                 # Compute loss locally then aggregate
@@ -803,41 +815,98 @@ class FSDPSFTTrainer:
                     return
 
 
+def _get_sft_dataloader_kwargs(data_config, device_name):
+    """Keep ordinary accelerator defaults; never request unknown pinned allocators."""
+    private_device = device_name in ("flagos", "privateuseone")
+    supports_pinning = device_name in ("cuda", "npu", "xpu")
+    requested_pin_memory = bool(data_config.get("pin_memory", supports_pinning))
+    if requested_pin_memory and not supports_pinning:
+        logger.warning("Disabling SFT DataLoader pin_memory for unsupported device %s", device_name)
+    kwargs = {
+        "num_workers": int(data_config.get("num_workers", 0 if private_device else 8)),
+        "pin_memory": requested_pin_memory and supports_pinning,
+    }
+    if kwargs["pin_memory"]:
+        kwargs["pin_memory_device"] = device_name
+    return kwargs
+
+
+def _cleanup_sft_runtime():
+    """Attempt every teardown stage and surface the first failure to the caller."""
+
+    def synchronize():
+        operation = getattr(get_torch_device(), "synchronize", None)
+        if operation is not None:
+            operation()
+
+    def empty_cache():
+        operation = getattr(get_torch_device(), "empty_cache", None)
+        if operation is not None:
+            operation()
+
+    first_error = None
+    for operation in (gc.collect, synchronize, empty_cache, destroy_global_process_group, gc.collect):
+        try:
+            operation()
+        except Exception as exc:
+            logger.exception("SFT cleanup failed during %s", operation.__name__)
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
 def run_sft(config):
     device_name = get_device_name()
-    local_rank, rank, world_size = initialize_global_process_group()
+    trainer = train_dataset = val_dataset = tokenizer = device_mesh = ulysses_device_mesh = None
+    failed = False
+    try:
+        local_rank, rank, world_size = initialize_global_process_group()
+        device_mesh = init_device_mesh(device_type=device_name, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+        dp_size = world_size // config.ulysses_sequence_parallel_size
+        ulysses_device_mesh = init_device_mesh(
+            device_type=device_name,
+            mesh_shape=(dp_size, config.ulysses_sequence_parallel_size),
+            mesh_dim_names=("dp", "sp"),
+        )
+        # build tokenizer and datasets first
+        from verl.utils import hf_tokenizer
 
-    device_mesh = init_device_mesh(device_type=device_name, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
-    dp_size = world_size // config.ulysses_sequence_parallel_size
-    ulysses_device_mesh = init_device_mesh(
-        device_type=device_name,
-        mesh_shape=(dp_size, config.ulysses_sequence_parallel_size),
-        mesh_dim_names=("dp", "sp"),
-    )
-    # build tokenizer and datasets first
-    from verl.utils import hf_tokenizer
+        local_model_path = copy_to_local(src=config.model.partial_pretrain, verbose=True)
+        tokenizer = hf_tokenizer(local_model_path, trust_remote_code=config.model.trust_remote_code)
+        train_dataset = create_sft_dataset(
+            config.data.train_files, config.data, tokenizer, max_samples=config.data.get("train_max_samples", -1)
+        )
+        val_dataset = create_sft_dataset(
+            config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
+        )
 
-    local_model_path = copy_to_local(src=config.model.partial_pretrain, verbose=True)
-    tokenizer = hf_tokenizer(local_model_path, trust_remote_code=config.model.trust_remote_code)
-    train_dataset = create_sft_dataset(
-        config.data.train_files, config.data, tokenizer, max_samples=config.data.get("train_max_samples", -1)
-    )
-    val_dataset = create_sft_dataset(
-        config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
-    )
+        trainer = FSDPSFTTrainer(
+            config=config,
+            device_mesh=device_mesh,
+            ulysses_device_mesh=ulysses_device_mesh,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+        )
 
-    trainer = FSDPSFTTrainer(
-        config=config,
-        device_mesh=device_mesh,
-        ulysses_device_mesh=ulysses_device_mesh,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-    )
+        trainer.fit()
 
-    trainer.fit()
-
-    destroy_global_process_group()
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        # Release owned objects before destroying the process group. Always use
+        # normal Python teardown: backend finalization crashes must remain visible.
+        trainer = train_dataset = val_dataset = tokenizer = device_mesh = ulysses_device_mesh = None
+        try:
+            _cleanup_sft_runtime()
+        except Exception:
+            # Teardown errors are logged by the cleanup helper. Do not replace a
+            # training/setup exception with a secondary cleanup exception.
+            if not failed:
+                raise
+    print("VERL_SFT_CLEAN_EXIT", flush=True)
 
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)
@@ -858,6 +927,8 @@ def create_sft_dataset(data_paths, data_config, tokenizer, max_samples=-1):
         dataset_cls = load_extern_object(data_config.custom_cls.path, data_config.custom_cls.name)
     # Then check if multi-turn dataset should be used
     elif data_config.get("multiturn", {}).get("enable", False):
+        from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+
         dataset_cls = MultiTurnSFTDataset
     # Default to single-turn dataset
     else:

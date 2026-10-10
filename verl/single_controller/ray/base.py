@@ -35,6 +35,19 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _ray_accelerator_resource(device_name: str) -> str:
+    """Map logical Torch backends to Ray scheduler resource names.
+
+    FlagOS/DCU workers use Ray's GPU allocation and CUDA_VISIBLE_DEVICES
+    isolation, not a custom resource named after the PrivateUse1 device.
+    """
+    if device_name in ("cuda", "musa", "flagos"):
+        return "GPU"
+    if device_name == "npu":
+        return "NPU"
+    return device_name
+
+
 def get_random_string(length: int) -> str:
     import random
     import string
@@ -119,10 +132,7 @@ class RayResourcePool(ResourcePool):
             name if name else f"{self.name_prefix}verl_group_{'_'.join([str(count) for count in self._store])}:"
         )
         # print(f"pg_name_prefix = {pg_name_prefix}")
-        if device_name == "npu":
-            device_name = "NPU"
-        elif device_name in ("cuda", "musa"):
-            device_name = "GPU"
+        device_name = _ray_accelerator_resource(device_name)
 
         bundle = {"CPU": self.max_colocate_count}
         if self.use_gpu:
@@ -316,9 +326,9 @@ class RayClassWithInitArgs(ClassWithInitArgs):
         }
         options.update(self._options)
 
-        if use_gpu and device_name in ("cuda", "musa"):
+        if use_gpu and _ray_accelerator_resource(device_name) == "GPU":
             options["num_gpus"] = num_gpus
-        if use_gpu and device_name == "npu":
+        if use_gpu and _ray_accelerator_resource(device_name) == "NPU":
             options["resources"] = {"NPU": num_gpus}
 
         if len(self._additional_resource) > 1:

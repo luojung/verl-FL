@@ -26,10 +26,11 @@ from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.logger import DecoratorLoggerBase
 
 
-def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str]:
+def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str, str, str, str]:
     """Get current memory usage.
 
-    Note that CPU device memory info is always 0.
+    CPU device memory info retains the historical zero placeholders. Missing
+    FlagOS counters are "N/A"; allocator bytes never substitute for global usage.
 
     Args:
         unit (str, optional): The unit of memory measurement. Defaults to "GB".
@@ -46,12 +47,42 @@ def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str]:
         return "0.00", "0.00", "0.00", "0.00"
 
     divisor = 1024**3 if unit == "GB" else 1024**2 if unit == "MB" else 1024
-    mem_allocated = get_torch_device().memory_allocated()
-    mem_reserved = get_torch_device().memory_reserved()
-    # use get_torch_device().mem_get_info to profile device memory
-    # since vllm's sleep mode works below pytorch
-    # see https://github.com/vllm-project/vllm/pull/11743#issuecomment-2754338119
-    mem_free, mem_total = get_torch_device().mem_get_info()
+    if device is getattr(torch, "flagos", None):
+        # Allocator counters are per-process; they cannot stand in for global
+        # device usage. Unsupported or unavailable telemetry is explicitly N/A.
+        def read_metric(name):
+            fn = getattr(device, name, None)
+            if not callable(fn):
+                return None
+            try:
+                return fn()
+            except (AttributeError, NotImplementedError, RuntimeError, OSError):
+                return None
+
+        mem_allocated = read_metric("memory_allocated")
+        mem_reserved = read_metric("memory_reserved")
+        memory_info = read_metric("mem_get_info")
+        mem_used = mem_total = None
+        if memory_info is not None:
+            mem_free, mem_total = memory_info
+            mem_used = mem_total - mem_free
+        else:
+            get_properties = getattr(device, "get_device_properties", None)
+            if callable(get_properties):
+                try:
+                    mem_total = getattr(get_properties(get_device_id()), "total_memory", None)
+                except (AttributeError, NotImplementedError, RuntimeError, OSError):
+                    pass
+
+        def format_metric(value):
+            return "N/A" if value is None else f"{value / divisor:.{precision}f}"
+
+        return tuple(format_metric(value) for value in (mem_allocated, mem_reserved, mem_used, mem_total))
+
+    # Keep existing accelerator behavior, including surfacing real API errors.
+    mem_allocated = device.memory_allocated()
+    mem_reserved = device.memory_reserved()
+    mem_free, mem_total = device.mem_get_info()
     mem_used = mem_total - mem_free
     mem_allocated = f"{mem_allocated / divisor:.{precision}f}"
     mem_reserved = f"{mem_reserved / divisor:.{precision}f}"

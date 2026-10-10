@@ -83,7 +83,7 @@ class SFTDataset(Dataset):
             import pandas
 
             while isinstance(ls, pandas.core.series.Series | numpy.ndarray) and len(ls) == 1:
-                ls = ls[0]
+                ls = ls.iloc[0] if isinstance(ls, pandas.core.series.Series) else ls[0]
             return ls
 
         dataframes = []
@@ -117,7 +117,7 @@ class SFTDataset(Dataset):
                 print(f"self.prompts={self.prompts}")
                 raise
         if isinstance(self.prompts, pd.DataFrame):
-            self.prompts = self.prompts.squeeze()
+            self.prompts = self.prompts.squeeze(axis=1)
         self.prompts = self.prompts.tolist()
         self.responses = self.dataframe[self.response_key]
         for key in self.response_dict_keys:
@@ -127,7 +127,7 @@ class SFTDataset(Dataset):
                 print(f"self.responses={self.responses}")
                 raise
         if isinstance(self.responses, pd.DataFrame):
-            self.responses = self.responses.squeeze()
+            self.responses = self.responses.squeeze(axis=1)
         self.responses = self.responses.tolist()
 
     def __len__(self):

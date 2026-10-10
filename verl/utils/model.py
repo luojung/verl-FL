@@ -28,12 +28,8 @@ from tensordict.tensorclass import NonTensorData
 from torch import nn
 from transformers import (
     AutoConfig,
-    AutoModel,
     AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForSequenceClassification,
     AutoModelForTokenClassification,
-    AutoModelForVision2Seq,
     GenerationConfig,
     MistralForSequenceClassification,
     PretrainedConfig,
@@ -43,6 +39,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from verl.models.registry import ModelRegistry
 from verl.utils.import_utils import is_trl_available
+from verl.utils.model_compat import get_auto_model_class
 
 
 class LambdaLayer(nn.Module):
@@ -619,8 +616,6 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
-    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
-
     try:
         model = AutoModelForTokenClassification.from_pretrained(
             pretrained_model_name_or_path=local_path,
@@ -630,7 +625,7 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
             trust_remote_code=trust_remote_code,
         )
         return model
-    except BaseException as e:
+    except (ValueError, KeyError) as e:
         if not is_trl_available():
             raise RuntimeError(
                 f"model({local_path}) is not a value head model, please install trl to make it valid"
@@ -640,10 +635,7 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
 
     from trl import AutoModelForCausalLMWithValueHead
 
-    if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
-        module_class = AutoModelForVision2Seq
-    else:
-        module_class = AutoModelForCausalLM
+    module_class = get_auto_model_class(model_config)
     ori_model = module_class.from_pretrained(
         pretrained_model_name_or_path=local_path,
         torch_dtype=torch_dtype,
@@ -656,41 +648,9 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
     return model
 
 
-_architecture_to_auto_class = {
-    "ForCausalLM": AutoModelForCausalLM,
-    "ForVision2Seq": AutoModelForVision2Seq,
-    "ForTokenClassification": AutoModelForTokenClassification,
-    "ForSequenceClassification": AutoModelForSequenceClassification,
-}
-
-
 def get_hf_auto_model_class(hf_config):
-    has_remote_code = hasattr(hf_config, "auto_map") and any(
-        hf_config.architectures[0] in val for val in hf_config.auto_map.values()
-    )
-    if has_remote_code:
-        auto_class = next(k for k, v in hf_config.auto_map.items() if hf_config.architectures[0] in v)
-        match auto_class:
-            case "AutoModelForVision2Seq":
-                actor_module_class = AutoModelForVision2Seq
-            case "AutoModelForCausalLM":
-                actor_module_class = AutoModelForCausalLM
-            case "AutoModelForImageTextToText":
-                actor_module_class = AutoModelForImageTextToText
-            case _:
-                actor_module_class = AutoModel
-    else:
-        actor_module_class = AutoModel
-        # For VLM models, we use type to check instead of architecture
-        if type(hf_config) in AutoModelForImageTextToText._model_mapping.keys():
-            actor_module_class = AutoModelForImageTextToText
-        else:
-            for key, cls in _architecture_to_auto_class.items():
-                if key in hf_config.architectures[0]:
-                    actor_module_class = cls
-                    break
-
-    return actor_module_class
+    """Backward-compatible entry point for the local auto-head selector."""
+    return get_auto_model_class(hf_config)
 
 
 def extract_multi_modal_inputs(

@@ -31,6 +31,7 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+from verl.utils.model_compat import get_text_forward_kwargs
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -190,7 +191,8 @@ class DataParallelPPOActor(BasePPOActor):
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
-                extra_args = {}
+                extra_args = get_text_forward_kwargs(getattr(self.actor_module, "config", None), input_ids_rmpad)
+                extra_args.update(multi_modal_inputs)
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
@@ -199,7 +201,6 @@ class DataParallelPPOActor(BasePPOActor):
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
-                    **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
@@ -274,7 +275,8 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
-                extra_args = {}
+                extra_args = get_text_forward_kwargs(getattr(self.actor_module, "config", None), input_ids)
+                extra_args.update(multi_modal_inputs)
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
@@ -283,7 +285,6 @@ class DataParallelPPOActor(BasePPOActor):
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating

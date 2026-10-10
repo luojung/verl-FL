@@ -20,7 +20,7 @@ _current_platform: PlatformBase | None = None
 
 # Built-in platform names that are auto-detected.  Third-party backends can
 # be added via ``set_platform()`` without modifying this list.
-_BUILTIN_PLATFORMS = ("cuda", "npu", "musa", "cpu")
+_BUILTIN_PLATFORMS = ("flagos", "cuda", "npu", "musa", "cpu")
 
 
 def _detect_platform_name() -> str:
@@ -40,7 +40,18 @@ def _detect_platform_name() -> str:
             logger.info("Platform override from VERL_PLATFORM=%s", env_name)
             return env_name
 
-    # 2. Auto-detect Moore Threads MUSA  (must come before CUDA because
+    # 2. Probe the optional backend before CUDA aliases, but never make a
+    # missing/broken Torch-FL installation fatal to ordinary auto-detection.
+    try:
+        from .platform_flagos import _load_flagos_device
+
+        device = _load_flagos_device()
+        if device.is_available() and device.device_count() > 0:
+            return "flagos"
+    except Exception:
+        logger.debug("Optional FlagOS auto-detection failed", exc_info=True)
+
+    # 3. Auto-detect Moore Threads MUSA  (must come before CUDA because
     #    torch_musa patches torch.cuda to return True on MUSA devices)
     try:
         import torch
@@ -75,6 +86,13 @@ def _detect_platform_name() -> str:
 
 def _create_platform(name: str) -> PlatformBase:
     """Instantiate the concrete platform for *name*."""
+    if name == "flagos":
+        from .platform_flagos import PlatformFlagOS
+
+        # Initialization and fail-fast validation happen once in get_platform().
+        # Never replace a selected FlagOS backend with a CPU platform.
+        return PlatformFlagOS()
+
     if name == "cuda":
         from .platform_cuda import PlatformCUDA
 
@@ -124,8 +142,10 @@ def get_platform() -> PlatformBase:
     global _current_platform
     if _current_platform is None:
         name = _detect_platform_name()
-        _current_platform = _create_platform(name)
-        _current_platform.ensure_initialized()
+        platform = _create_platform(name)
+        platform.ensure_initialized()
+        # Do not cache a partially initialized backend after an exception.
+        _current_platform = platform
         logger.info("verl platform initialised: %s", _current_platform.device_name)
     return _current_platform
 
